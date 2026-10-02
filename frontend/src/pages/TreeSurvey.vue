@@ -22,7 +22,7 @@ const treeStore = useTreeStore()
 
 const treeId = computed<string>(() => String(route.params.id ?? ''))
 const tree = computed(() => treeStore.trees.find((item) => item.id === treeId.value) ?? null)
-const { rows, loading, create, update, remove } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false })
+const { rows, loading, create, update, setVoided, remove } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false })
 const { items } = useTreeHistory(treeId)
 
 const dialogVisible = ref(false)
@@ -164,6 +164,20 @@ async function handleDelete(row: Survey): Promise<void> {
   }
   await remove(row.id)
   ElMessage.success('检查记录已删除')
+}
+
+async function handleVoid(row: Survey): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `确认作废 ${row.date} 的检查记录？作废后该记录不再参与对比、生长量计算与历史时间线，但会保留以供外业同步。`,
+      '作废确认',
+      { type: 'warning', confirmButtonText: '作废', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' }
+    )
+  } catch {
+    return
+  }
+  await setVoided(row.id)
+  ElMessage.success('检查记录已作废')
 }
 </script>
 
@@ -319,9 +333,10 @@ async function handleDelete(row: Survey): Promise<void> {
                   <el-tag size="small" type="info">{{ row.siteNote }}</el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="操作" width="140" fixed="right">
+              <el-table-column label="操作" width="190" fixed="right">
                 <template #default="{ row }">
                   <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
+                  <el-button link type="warning" size="small" @click="handleVoid(row)">作废</el-button>
                   <el-button link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
                 </template>
               </el-table-column>

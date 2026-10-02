@@ -6,9 +6,13 @@ import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 import type { Review, ReviewDraft, Trend, Vigor } from '../types/review'
 import { VIGOR_NEED_FOLLOW_UP, VIGOR_OPTIONS } from '../types/review'
-import { db, initDatabase, putReview, removeReview } from '../utils/db'
+import { ROW_REVISION, db, initDatabase, putReview, removeReview, voidReview } from '../utils/db'
+import type { MergeReport } from '../utils/merge'
 import { nowIso, uuid } from '../utils/id'
 import { useTreeStore } from './treeStore'
+
+/** 最近一次外业包合并报告在 localStorage 的键 */
+const MERGE_REPORT_KEY = 'gbheritagetree:lastMergeReport'
 
 /** 长势复评筛选条件 */
 export interface ReviewFilters {
@@ -24,11 +28,25 @@ export interface ReviewValidation {
   message: string
 }
 
+/** 读取上次合并报告（localStorage 持久化，刷新后仍可在复评页查看处理数量与冲突） */
+function loadLastMergeReport(): MergeReport | null {
+  try {
+    const raw = window.localStorage.getItem(MERGE_REPORT_KEY)
+    if (raw === null || raw === '') return null
+    const parsed = JSON.parse(raw) as MergeReport
+    return typeof parsed === 'object' && parsed !== null && typeof parsed.mergedAt === 'string' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
 export const useReviewStore = defineStore('review', () => {
   const filters = reactive<ReviewFilters>({ keyword: '', treeId: 'all', vigor: 'all', trend: 'all' })
   const selectedIds = ref<string[]>([])
   const lastMessage = ref('')
   const revision = ref(0)
+  /** 最近一次外业包合并报告（成功含处理数量，失败含失败记录与冲突） */
+  const lastMergeReport = ref<MergeReport | null>(loadLastMergeReport())
 
   /** 长势分布统计，供复评页徽标使用 */
   const vigorStats = computed<Record<Vigor, number>>(() => {
@@ -105,7 +123,8 @@ export const useReviewStore = defineStore('review', () => {
       followUp: draft.followUp.trim(),
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
+      voided: false,
     }
     await putReview(row)
     revision.value += 1
@@ -141,6 +160,33 @@ export const useReviewStore = defineStore('review', () => {
     revision.value += 1
   }
 
+  /** 作废复评记录（保留墓碑参与同步；复评待办按剩余最新记录重算） */
+  async function voidReviewRecord(reviewId: string): Promise<void> {
+    await voidReview(reviewId)
+    selectedIds.value = selectedIds.value.filter((id) => id !== reviewId)
+    revision.value += 1
+  }
+
+  /** 保存最近一次合并报告并持久化，供复评页展示处理数量 / 失败冲突 */
+  function setMergeReport(report: MergeReport): void {
+    lastMergeReport.value = report
+    try {
+      window.localStorage.setItem(MERGE_REPORT_KEY, JSON.stringify(report))
+    } catch {
+      /* 隐私模式下静默降级，仅内存中保留 */
+    }
+  }
+
+  /** 清除最近一次合并报告 */
+  function clearMergeReport(): void {
+    lastMergeReport.value = null
+    try {
+      window.localStorage.removeItem(MERGE_REPORT_KEY)
+    } catch {
+      /* 忽略 */
+    }
+  }
+
   async function refreshCounts(): Promise<void> {
     await useTreeStore().refreshCounts()
   }
@@ -150,6 +196,7 @@ export const useReviewStore = defineStore('review', () => {
     selectedIds,
     lastMessage,
     revision,
+    lastMergeReport,
     vigorStats,
     followUpMissing,
     requireFollowUp,
@@ -161,6 +208,9 @@ export const useReviewStore = defineStore('review', () => {
     createReview,
     updateReview,
     deleteReview,
+    voidReviewRecord,
+    setMergeReport,
+    clearMergeReport,
     refreshCounts,
   }
 })

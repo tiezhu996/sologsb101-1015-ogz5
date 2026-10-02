@@ -1,8 +1,8 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据库名：gbheritagetree
- * - 含数据结构版本号与 v1 → v2 升级迁移逻辑（升级时按 version().stores() 补齐索引）
- * - 提供各表增删改查、整库快照导入导出与重置
+ * - 含数据结构版本号与 v1 → v3 升级迁移逻辑（升级时按 version().stores() 补齐索引）
+ * - 提供各表增删改查、外业包增量合并、整库快照导入导出与重置
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
 import Dexie, { type Table } from 'dexie'
@@ -13,15 +13,16 @@ import type { Support } from '../types/support'
 import type { Review } from '../types/review'
 import { nowIso, today } from './id'
 import { seedDatabase } from './seed'
+import { COLLECTION_KEYS, type CollectionKey, planMerge, type MergeReport } from './merge'
 
 /** 数据库名 */
 export const DB_NAME = 'gbheritagetree'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class HeritageTreeDatabase extends Dexie {
   trees!: Table<Tree, string>
@@ -82,6 +83,30 @@ class HeritageTreeDatabase extends Dexie {
           if (typeof row.checkCycleMon !== 'number') row.checkCycleMon = 12
         })
       })
+
+    // ---------- v3：全表补齐「作废标记」，支持外业包按修订时间增量合并 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        trees: 'id, code, species, protectLevel, ageYears, createdAt, updatedAt, owner',
+        surveys: 'id, treeId, [treeId+date], date, siteNote',
+        measures: 'id, treeId, type, state, date, operator',
+        supports: 'id, treeId, type, installDate, lastCheckDate',
+        reviews: 'id, treeId, date, vigor, trend',
+      })
+      .upgrade(async (tx) => {
+        const tables = [
+          tx.table('trees'),
+          tx.table('surveys'),
+          tx.table('measures'),
+          tx.table('supports'),
+          tx.table('reviews'),
+        ]
+        for (const table of tables) {
+          await table.toCollection().modify((row: Record<string, unknown>) => {
+            if (typeof row.voided !== 'boolean') row.voided = false
+          })
+        }
+      })
   }
 }
 
@@ -120,7 +145,22 @@ export async function getTree(id: string): Promise<Tree | undefined> {
 }
 
 export async function putTree(row: Tree): Promise<void> {
-  await db.trees.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
+  await db.trees.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION, voided: row.voided === true })
+}
+
+/**
+ * 作废古树档案：保留墓碑，并在同一事务内把其下检查、措施、加固、复评一并作废，
+ * 使作废古树的全部数据从列表、统计与超期提醒中消失（墓碑仍可供外业同步）。
+ */
+export async function voidTree(id: string): Promise<void> {
+  const stamp = nowIso()
+  await db.transaction('rw', db.trees, db.surveys, db.measures, db.supports, db.reviews, async () => {
+    await db.trees.update(id, { voided: true, updatedAt: stamp })
+    await db.surveys.where('treeId').equals(id).modify({ voided: true, updatedAt: stamp } as never)
+    await db.measures.where('treeId').equals(id).modify({ voided: true, updatedAt: stamp } as never)
+    await db.supports.where('treeId').equals(id).modify({ voided: true, updatedAt: stamp } as never)
+    await db.reviews.where('treeId').equals(id).modify({ voided: true, updatedAt: stamp } as never)
+  })
 }
 
 /** 删除古树并级联清理其检查、措施、加固与复评记录 */
@@ -147,7 +187,12 @@ export async function listSurveysByTree(treeId: string): Promise<Survey[]> {
 }
 
 export async function putSurvey(row: Survey): Promise<void> {
-  await db.surveys.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
+  await db.surveys.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION, voided: row.voided === true })
+}
+
+/** 作废树体检查记录（保留墓碑参与同步） */
+export async function voidSurvey(id: string): Promise<void> {
+  await db.surveys.update(id, { voided: true, updatedAt: nowIso() })
 }
 
 export async function removeSurvey(id: string): Promise<void> {
@@ -172,8 +217,8 @@ export async function listMeasuresByTree(treeId: string): Promise<Measure[]> {
  */
 export async function putMeasure(row: Measure): Promise<void> {
   await db.transaction('rw', db.trees, db.measures, async () => {
-    await db.measures.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
-    if (row.state !== '已完成') return
+    await db.measures.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION, voided: row.voided === true })
+    if (row.state !== '已完成' || row.voided === true) return
     const tree = await db.trees.get(row.treeId)
     if (!tree) return
     if (tree.lastMeasureDate >= row.date) return
@@ -181,8 +226,39 @@ export async function putMeasure(row: Measure): Promise<void> {
   })
 }
 
+/**
+ * 按当前未作废且已完成的措施，重算某株古树的最近复壮日期。
+ * 在措施被作废 / 删除或外业包合并后调用，确保回写字段与台账一致。
+ * 返回该古树最新的最近复壮日期（无已完成措施时为空串）。
+ */
+export async function recomputeTreeLastMeasureDate(treeId: string): Promise<string> {
+  const rows = await db.measures.where('treeId').equals(treeId).toArray()
+  const latest = rows.reduce<string>((acc, row) => {
+    if (row.voided === true || row.state !== '已完成') return acc
+    return row.date > acc ? row.date : acc
+  }, '')
+  const tree = await db.trees.get(treeId)
+  if (tree && tree.lastMeasureDate !== latest) {
+    await db.trees.update(treeId, { lastMeasureDate: latest })
+  }
+  return latest
+}
+
+/** 作废复壮措施并重算古树最近复壮日期（作废的完成措施不再参与回写） */
+export async function voidMeasure(id: string): Promise<void> {
+  const existing = await db.measures.get(id)
+  await db.transaction('rw', db.trees, db.measures, async () => {
+    await db.measures.update(id, { voided: true, updatedAt: nowIso() })
+    if (existing) await recomputeTreeLastMeasureDate(existing.treeId)
+  })
+}
+
 export async function removeMeasure(id: string): Promise<void> {
-  await db.measures.delete(id)
+  const existing = await db.measures.get(id)
+  await db.transaction('rw', db.trees, db.measures, async () => {
+    await db.measures.delete(id)
+    if (existing) await recomputeTreeLastMeasureDate(existing.treeId)
+  })
 }
 
 /** 批量修改措施状态；改为「已完成」时同步回写古树最近复壮日期 */
@@ -208,7 +284,12 @@ export async function listSupportsByTree(treeId: string): Promise<Support[]> {
 }
 
 export async function putSupport(row: Support): Promise<void> {
-  await db.supports.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
+  await db.supports.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION, voided: row.voided === true })
+}
+
+/** 作废加固件记录（保留墓碑参与同步） */
+export async function voidSupport(id: string): Promise<void> {
+  await db.supports.update(id, { voided: true, updatedAt: nowIso() })
 }
 
 export async function removeSupport(id: string): Promise<void> {
@@ -233,7 +314,12 @@ export async function listReviewsByTree(treeId: string): Promise<Review[]> {
 }
 
 export async function putReview(row: Review): Promise<void> {
-  await db.reviews.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
+  await db.reviews.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION, voided: row.voided === true })
+}
+
+/** 作废长势复评记录（保留墓碑参与同步） */
+export async function voidReview(id: string): Promise<void> {
+  await db.reviews.update(id, { voided: true, updatedAt: nowIso() })
 }
 
 export async function removeReview(id: string): Promise<void> {
@@ -265,22 +351,68 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
   return { name: DB_NAME, schemaVersion: DB_SCHEMA_VERSION, exportedAt: nowIso(), trees, surveys, measures, supports, reviews }
 }
 
-/** 用快照覆盖整库（导入存档） */
-export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
+/**
+ * 增量合并外业包。
+ * 先用 planMerge 纯函数完成整包校验与逐条裁决；存在致命问题时直接抛错，
+ * 事务不写入任何内容，现有档案保持原样。校验通过后在同一个 rw 事务内
+ * 写入五张表，并按「未作废 + 已完成」措施为每株受影响古树重算最近复壮日期。
+ */
+export async function mergeSnapshot(snapshot: DatabaseSnapshot, sourceName = ''): Promise<MergeReport> {
+  const local = await exportSnapshot()
+  const plan = planMerge(local, snapshot, nowIso(), sourceName)
+  if (!plan.report.ok) {
+    throw new MergeRejectedError(plan.report)
+  }
+
   await db.transaction('rw', db.trees, db.surveys, db.measures, db.supports, db.reviews, async () => {
-    await Promise.all([
-      db.trees.clear(),
-      db.surveys.clear(),
-      db.measures.clear(),
-      db.supports.clear(),
-      db.reviews.clear(),
-    ])
-    await db.trees.bulkPut(snapshot.trees.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.measures.bulkPut(snapshot.measures.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.supports.bulkPut(snapshot.supports.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.reviews.bulkPut(snapshot.reviews.map((row) => ({ ...row, revision: ROW_REVISION })))
+    const tables: Record<CollectionKey, Table<Record<string, unknown>, string>> = {
+      trees: db.trees as unknown as Table<Record<string, unknown>, string>,
+      surveys: db.surveys as unknown as Table<Record<string, unknown>, string>,
+      measures: db.measures as unknown as Table<Record<string, unknown>, string>,
+      supports: db.supports as unknown as Table<Record<string, unknown>, string>,
+      reviews: db.reviews as unknown as Table<Record<string, unknown>, string>,
+    }
+    for (const key of COLLECTION_KEYS) {
+      await tables[key].clear()
+      await tables[key].bulkPut(
+        plan.reports[key].rows.map((row) => ({
+          ...row,
+          voided: row.voided === true,
+          revision: typeof row.revision === 'number' ? row.revision : ROW_REVISION,
+        })),
+      )
+    }
+
+    // 合并后按已完成复壮措施重算每株（未作废古树）的最近复壮日期
+    const treeRows = plan.reports.trees.rows
+    let recomputed = 0
+    for (const treeRow of treeRows) {
+      if (treeRow.voided === true) continue
+      const treeId = String(treeRow.id)
+      const latest = plan.reports.measures.rows.reduce<string>((acc, row) => {
+        if (row.treeId !== treeId || row.voided === true || row.state !== '已完成') return acc
+        return typeof row.date === 'string' && row.date > acc ? row.date : acc
+      }, '')
+      if (treeRow.lastMeasureDate !== latest) {
+        treeRow.lastMeasureDate = latest
+        await db.trees.update(treeId, { lastMeasureDate: latest })
+      }
+      recomputed += 1
+    }
+    plan.report.recomputedTrees = recomputed
   })
+
+  return plan.report
+}
+
+/** 整包被拒绝时抛出：携带完整失败报告（失败记录与冲突清单） */
+export class MergeRejectedError extends Error {
+  report: MergeReport
+  constructor(report: MergeReport) {
+    super(report.message)
+    this.name = 'MergeRejectedError'
+    this.report = report
+  }
 }
 
 /** 清空全部数据并重新灌入演示数据 */

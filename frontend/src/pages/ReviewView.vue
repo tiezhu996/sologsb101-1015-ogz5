@@ -15,8 +15,9 @@ import { useIdbTable } from '@/hooks/useIdbTable'
 import { HISTORY_KIND_LABEL, useTreeHistory } from '@/hooks/useTreeHistory'
 import { useReviewStore } from '@/stores/reviewStore'
 import { useTreeStore } from '@/stores/treeStore'
-import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
-import { exportSnapshotJson, exportTreeCsvFile, parseSnapshot } from '@/utils/export'
+import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, mergeSnapshot, MergeRejectedError, resetDatabase } from '@/utils/db'
+import { COLLECTION_KEYS, COLLECTION_LABEL, MERGE_ISSUE_LABEL, type CollectionKey, type MergeReport } from '@/utils/merge'
+import { exportSnapshotJson, exportTreeCsvFile, parseMergePackage } from '@/utils/export'
 import { TREND_OPTIONS, VIGOR_OPTIONS, VIGOR_NEED_FOLLOW_UP, type Review, type ReviewDraft, type Trend, type Vigor } from '@/types/review'
 
 const router = useRouter()
@@ -59,7 +60,9 @@ const treeLabel = computed<Record<string, string>>(() =>
 
 const filtered = computed<Review[]>(() => {
   const keyword = reviewStore.filters.keyword.trim().toLowerCase()
+  const activeTreeIds = new Set(treeStore.trees.map((tree) => tree.id))
   return rows.value
+    .filter((row) => activeTreeIds.has(row.treeId))
     .filter((row) => {
       if (reviewStore.filters.treeId !== 'all' && row.treeId !== reviewStore.filters.treeId) return false
       if (reviewStore.filters.vigor !== 'all' && row.vigor !== reviewStore.filters.vigor) return false
@@ -77,9 +80,10 @@ const filtered = computed<Review[]>(() => {
 const timelineTree = computed(() => treeStore.trees.find((tree) => tree.id === timelineTreeId.value) ?? null)
 const { items: timelineItems } = useTreeHistory(timelineTreeId)
 
-const weakCount = computed<number>(
-  () => rows.value.filter((row) => VIGOR_NEED_FOLLOW_UP.includes(row.vigor)).length
-)
+const weakCount = computed<number>(() => {
+  const activeTreeIds = new Set(treeStore.trees.map((tree) => tree.id))
+  return rows.value.filter((row) => activeTreeIds.has(row.treeId) && VIGOR_NEED_FOLLOW_UP.includes(row.vigor)).length
+})
 
 onMounted(() => {
   void treeStore.loadAll()
@@ -182,14 +186,60 @@ async function handleImport(uploadFile: UploadFile): Promise<void> {
   const raw = uploadFile.raw
   if (raw === undefined) return
   const text = await raw.text()
-  const result = parseSnapshot(text)
+  const result = parseMergePackage(text)
   if (!result.ok || result.snapshot === null) {
     ElMessage.error(result.message)
     return
   }
-  await importSnapshot(result.snapshot)
-  await treeStore.loadAll()
-  ElMessage.success(`导入成功：${result.message}`)
+  try {
+    const report = await mergeSnapshot(result.snapshot, uploadFile.name)
+    reviewStore.setMergeReport(report)
+    await treeStore.loadAll()
+    ElMessage.success(`外业包合并成功：${report.message}`)
+  } catch (error) {
+    if (error instanceof MergeRejectedError) {
+      reviewStore.setMergeReport(error.report)
+      ElMessage.error(`外业包已整包拒绝，现有档案保持原样：${error.report.fatalCount} 条致命问题`)
+    } else {
+      ElMessage.error(error instanceof Error ? error.message : '外业包合并失败')
+    }
+  }
+}
+
+async function handleVoid(row: Review): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `确认作废 ${row.date} 的长势复评记录（${row.vigor}）？作废后该记录不再参与复评待办与时间线，但会作为墓碑保留以供外业同步。`,
+      '作废确认',
+      { type: 'warning', confirmButtonText: '作废', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' }
+    )
+  } catch {
+    return
+  }
+  await reviewStore.voidReviewRecord(row.id)
+  ElMessage.success('复评记录已作废')
+}
+
+/** 最近一次合并报告（成功展示处理数量，失败展示致命问题与冲突） */
+const mergeReport = computed<MergeReport | null>(() => reviewStore.lastMergeReport)
+
+const reportCollectionKeys = COLLECTION_KEYS.filter((key) => {
+  const report = mergeReport.value
+  return report !== null && report.stats[key].received > 0
+})
+
+function reportStat(key: CollectionKey): string {
+  const stat = mergeReport.value?.stats[key]
+  if (stat === undefined) return ''
+  return `收到 ${stat.received} · 新增 ${stat.added} · 更新 ${stat.updated} · 作废 ${stat.voided} · 恢复 ${stat.restored} · 跳过 ${stat.skipped}`
+}
+
+function reportIssueRows(): MergeReport['issues'] {
+  return mergeReport.value?.issues ?? []
+}
+
+function clearReport(): void {
+  reviewStore.clearMergeReport()
 }
 
 function handleReset(): void {
@@ -256,6 +306,76 @@ function handleFilterChange(key: string, value: string): void {
       description="请到复评列表中补充后续措施（换土、透气、树洞修补、加固等），否则无法通过复评校验。"
     />
 
+    <el-card v-if="mergeReport !== null" shadow="never" class="merge-panel">
+      <template #header>
+        <div class="card-header">
+          <span class="card-header__title">外业包合并结果</span>
+          <el-space wrap>
+            <el-tag :type="mergeReport.ok ? 'success' : 'danger'" effect="dark" size="small">
+              {{ mergeReport.ok ? '合并成功' : '整包拒绝 · 档案保持原样' }}
+            </el-tag>
+            <el-button link type="info" size="small" @click="clearReport">清除记录</el-button>
+          </el-space>
+        </div>
+      </template>
+
+      <el-alert
+        :type="mergeReport.ok ? (mergeReport.warningCount > 0 ? 'warning' : 'success') : 'error'"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        :title="mergeReport.message"
+        :description="
+          mergeReport.sourceName
+            ? `来源文件：${mergeReport.sourceName}；合并时间：${mergeReport.mergedAt}`
+            : `合并时间：${mergeReport.mergedAt}`
+        "
+      />
+
+      <template v-if="mergeReport.ok">
+        <el-descriptions :column="1" border size="small" class="mb-14">
+          <el-descriptions-item
+            v-for="key in reportCollectionKeys"
+            :key="key"
+            :label="COLLECTION_LABEL[key]"
+          >
+            {{ reportStat(key) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="最近复壮日期重算">
+            已按未作废的已完成复壮措施重算 {{ mergeReport.recomputedTrees }} 株古树
+          </el-descriptions-item>
+        </el-descriptions>
+      </template>
+
+      <template v-if="reportIssueRows().length > 0">
+        <div class="merge-issues__title">
+          {{ mergeReport.ok ? '冲突明细（已保留站内较新版本）' : '失败记录与冲突（整包未写入）' }}
+        </div>
+        <el-table :data="reportIssueRows()" size="small" border stripe row-key="id">
+          <el-table-column label="级别" width="90">
+            <template #default="{ row }">
+              <el-tag :type="row.level === 'fatal' ? 'danger' : 'warning'" size="small">
+                {{ row.level === 'fatal' ? '拒绝' : '冲突' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="类型" width="130">
+            <template #default="{ row }">{{ MERGE_ISSUE_LABEL[row.code as keyof typeof MERGE_ISSUE_LABEL] }}</template>
+          </el-table-column>
+          <el-table-column label="数据表" width="110">
+            <template #default="{ row }">
+              {{ row.collection === 'package' ? '整包' : COLLECTION_LABEL[row.collection as CollectionKey] }}
+            </template>
+          </el-table-column>
+          <el-table-column prop="id" label="记录编号" min-width="180" />
+          <el-table-column prop="treeId" label="关联古树" min-width="160">
+            <template #default="{ row }">{{ row.treeId || '—' }}</template>
+          </el-table-column>
+          <el-table-column prop="message" label="说明" min-width="260" />
+        </el-table>
+      </template>
+    </el-card>
+
     <el-row :gutter="14">
       <el-col :xs="24" :lg="17">
         <el-card shadow="never">
@@ -277,9 +397,9 @@ function handleFilterChange(key: string, value: string): void {
                   accept=".json"
                   :on-change="handleImport"
                 >
-                  <el-button>
+                  <el-button type="primary" plain>
                     <el-icon><Upload /></el-icon>
-                    <span>导入 JSON 存档</span>
+                    <span>合并外业包（增量）</span>
                   </el-button>
                 </el-upload>
                 <el-button type="danger" plain @click="handleReset">重置演示数据</el-button>
@@ -364,9 +484,10 @@ function handleFilterChange(key: string, value: string): void {
                 <span v-else>{{ row.followUp }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="140" fixed="right">
+            <el-table-column label="操作" width="190" fixed="right">
               <template #default="{ row }">
                 <el-button link type="primary" size="small" @click.stop="openEdit(row)">编辑</el-button>
+                <el-button link type="warning" size="small" @click.stop="handleVoid(row)">作废</el-button>
                 <el-button link type="danger" size="small" @click.stop="handleDelete(row)">删除</el-button>
               </template>
             </el-table-column>
@@ -529,5 +650,16 @@ function handleFilterChange(key: string, value: string): void {
 
 .mb-14 {
   margin-bottom: 14px;
+}
+
+.merge-panel {
+  margin-bottom: 14px;
+}
+
+.merge-issues__title {
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #2f2a24;
 }
 </style>

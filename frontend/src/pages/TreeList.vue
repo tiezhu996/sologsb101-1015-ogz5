@@ -132,6 +132,20 @@ async function handleDelete(row: Tree): Promise<void> {
   ElMessage.success('古树档案已删除')
 }
 
+async function handleVoid(row: Tree): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `确认作废古树档案「${row.code} ${row.species}」？作废后该档案及其检查、措施、加固与复评记录都会从列表、统计与提醒中隐藏，但记录会保留以供外业回站合并同步。`,
+      '作废确认',
+      { type: 'warning', confirmButtonText: '作废', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' }
+    )
+  } catch {
+    return
+  }
+  await treeStore.voidTreeRecord(row.id)
+  ElMessage.success('古树档案已作废')
+}
+
 function goSurveys(row: Tree): void {
   treeStore.selectTree(row.id)
   void router.push(`/trees/${row.id}/surveys`)
@@ -255,10 +269,11 @@ function handleFilterChange(key: string, value: string): void {
             <span v-else>{{ row.lastMeasureDate }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="操作" width="300" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click.stop="goSurveys(row)">树体检查</el-button>
             <el-button link type="primary" size="small" @click.stop="openEdit(row)">编辑</el-button>
+            <el-button link type="warning" size="small" @click.stop="handleVoid(row)">作废</el-button>
             <el-button link type="danger" size="small" @click.stop="handleDelete(row)">删除</el-button>
           </template>
         </el-table-column>

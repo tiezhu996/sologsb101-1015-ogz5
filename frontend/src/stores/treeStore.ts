@@ -20,6 +20,7 @@ import {
   initDatabase,
   putTree,
   removeTree,
+  voidTree,
 } from '../utils/db'
 import { nowIso, uuid } from '../utils/id'
 import {
@@ -211,12 +212,16 @@ export const useTreeStore = defineStore('tree', () => {
           return { treeRows, surveyRows, measureRows, supportRows, reviewRows }
         }).subscribe({
           next: ({ treeRows, surveyRows, measureRows, supportRows, reviewRows }) => {
-            const sorted = [...treeRows].sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
+            // 作废记录（墓碑）不进入任何页面列表、统计与派生数据；
+            // 古树被作废后，其下子记录即使本身未带作废标记（如外业包只同步了古树墓碑）也一并隐藏。
+            const activeTreeRows = treeRows.filter((row) => row.voided !== true)
+            const activeTreeIds = new Set(activeTreeRows.map((tree) => tree.id))
+            const sorted = [...activeTreeRows].sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
             trees.value = sorted
-            surveys.value = surveyRows
-            measures.value = measureRows
-            supports.value = supportRows
-            reviews.value = reviewRows
+            surveys.value = surveyRows.filter((row) => row.voided !== true && activeTreeIds.has(row.treeId))
+            measures.value = measureRows.filter((row) => row.voided !== true && activeTreeIds.has(row.treeId))
+            supports.value = supportRows.filter((row) => row.voided !== true && activeTreeIds.has(row.treeId))
+            reviews.value = reviewRows.filter((row) => row.voided !== true && activeTreeIds.has(row.treeId))
             loading.value = false
             ready.value = true
             error.value = ''
@@ -268,6 +273,7 @@ export const useTreeStore = defineStore('tree', () => {
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
+      voided: false,
     }
     await putTree(row)
     selectTree(row.id)
@@ -290,6 +296,13 @@ export const useTreeStore = defineStore('tree', () => {
 
   async function deleteTree(treeId: string): Promise<void> {
     await removeTree(treeId)
+    if (currentTreeId.value === treeId) selectTree(null)
+    await refreshCounts()
+  }
+
+  /** 作废古树档案（保留墓碑，不级联删除；列表、统计与提醒随即隐藏） */
+  async function voidTreeRecord(treeId: string): Promise<void> {
+    await voidTree(treeId)
     if (currentTreeId.value === treeId) selectTree(null)
     await refreshCounts()
   }
@@ -324,6 +337,7 @@ export const useTreeStore = defineStore('tree', () => {
     createTree,
     updateTree,
     deleteTree,
+    voidTreeRecord,
     refreshCounts,
   }
 })

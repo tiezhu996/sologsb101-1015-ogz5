@@ -22,7 +22,7 @@ export const SEED_IDS = {
 type Row<T> = Omit<T, 'createdAt' | 'updatedAt' | 'revision'>
 
 function wrap<T>(row: Row<T>): T {
-  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION } as T
+  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION, voided: false } as T
 }
 
 /**

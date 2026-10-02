@@ -13,6 +13,7 @@ export interface IdbRow {
   createdAt: string
   updatedAt: string
   revision: number
+  voided?: boolean
 }
 
 /** 新增记录入参：id / 时间戳 / 修订号由封装层补齐 */
@@ -23,6 +24,8 @@ export type NewRow<T extends IdbRow> = Omit<T, 'id' | 'createdAt' | 'updatedAt' 
 export interface UseIdbTableOptions<T extends IdbRow> {
   /** 是否按 updatedAt 倒序，默认 true */
   sortByUpdatedAt?: boolean
+  /** 是否包含作废（墓碑）记录，默认 false：正常列表与统计均隐藏作废行 */
+  includeVoided?: boolean
   onChange?: (rows: T[]) => void
 }
 
@@ -37,6 +40,8 @@ export interface UseIdbTableResult<T extends IdbRow> {
   create: (payload: NewRow<T>, idPrefix?: string) => Promise<T>
   update: (id: string, patch: Partial<T>) => Promise<void>
   upsert: (row: T) => Promise<void>
+  /** 作废一条记录（打墓碑标记并刷新修订时间） */
+  setVoided: (id: string, voided?: boolean) => Promise<void>
   remove: (id: string) => Promise<void>
   bulkPut: (rows: T[]) => Promise<void>
   clear: () => Promise<void>
@@ -46,7 +51,7 @@ export function useIdbTable<T extends IdbRow>(
   table: Table<T, string>,
   options: UseIdbTableOptions<T> = {}
 ): UseIdbTableResult<T> {
-  const { sortByUpdatedAt = true, onChange } = options
+  const { sortByUpdatedAt = true, includeVoided = false, onChange } = options
 
   const rows = ref([]) as Ref<T[]>
   const loading = ref(true)
@@ -55,8 +60,9 @@ export function useIdbTable<T extends IdbRow>(
   const subscription = shallowRef<{ unsubscribe: () => void } | null>(null)
 
   const applySort = (list: T[]): T[] => {
-    if (!sortByUpdatedAt) return [...list]
-    return [...list].sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))
+    const visible = includeVoided ? list : list.filter((row) => (row as { voided?: boolean }).voided !== true)
+    if (!sortByUpdatedAt) return [...visible]
+    return [...visible].sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))
   }
 
   const refresh = async (): Promise<void> => {
@@ -105,6 +111,7 @@ export function useIdbTable<T extends IdbRow>(
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
+      voided: false,
     } as T
     await table.put(record)
     return record
@@ -116,6 +123,10 @@ export function useIdbTable<T extends IdbRow>(
 
   const upsert = async (row: T): Promise<void> => {
     await table.put({ ...row, updatedAt: nowIso() })
+  }
+
+  const setVoided = async (id: string, voided = true): Promise<void> => {
+    await table.update(id, { voided, updatedAt: nowIso() } as never)
   }
 
   const remove = async (id: string): Promise<void> => {
@@ -141,6 +152,7 @@ export function useIdbTable<T extends IdbRow>(
     create,
     update,
     upsert,
+    setVoided,
     remove,
     bulkPut,
     clear,

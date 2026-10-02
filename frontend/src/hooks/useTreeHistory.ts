@@ -31,7 +31,7 @@ export const HISTORY_KIND_LABEL: Record<HistoryKind, string> = {
   review: '长势复评',
 }
 
-/** 纯函数：把四类记录聚合成时间线 */
+/** 纯函数：把四类记录聚合成时间线（作废记录不进入时间线） */
 export function buildHistory(
   surveys: Survey[],
   measures: Measure[],
@@ -39,7 +39,9 @@ export function buildHistory(
   reviews: Review[]
 ): HistoryItem[] {
   const items: HistoryItem[] = []
-  surveys.forEach((row) => {
+  surveys
+    .filter((row) => row.voided !== true)
+    .forEach((row) => {
     items.push({
       key: `survey-${row.id}`,
       kind: 'survey',
@@ -49,7 +51,9 @@ export function buildHistory(
       badge: row.siteNote,
     })
   })
-  measures.forEach((row) => {
+  measures
+    .filter((row) => row.voided !== true)
+    .forEach((row) => {
     items.push({
       key: `measure-${row.id}`,
       kind: 'measure',
@@ -59,7 +63,9 @@ export function buildHistory(
       badge: row.state,
     })
   })
-  supports.forEach((row) => {
+  supports
+    .filter((row) => row.voided !== true)
+    .forEach((row) => {
     items.push({
       key: `support-${row.id}`,
       kind: 'support',
@@ -69,7 +75,9 @@ export function buildHistory(
       badge: row.type,
     })
   })
-  reviews.forEach((row) => {
+  reviews
+    .filter((row) => row.voided !== true)
+    .forEach((row) => {
     items.push({
       key: `review-${row.id}`,
       kind: 'review',
@@ -106,19 +114,26 @@ export function useTreeHistory(treeId: Ref<string | null> | string | null): UseT
   void initDatabase()
   const subscription = liveQuery(async () => {
     await initDatabase()
-    const [surveyRows, measureRows, supportRows, reviewRows] = await Promise.all([
+    const [treeRows, surveyRows, measureRows, supportRows, reviewRows] = await Promise.all([
+      db.trees.toArray(),
       db.surveys.toArray(),
       db.measures.toArray(),
       db.supports.toArray(),
       db.reviews.toArray(),
     ])
-    return { surveyRows, measureRows, supportRows, reviewRows }
+    return { treeRows, surveyRows, measureRows, supportRows, reviewRows }
   }).subscribe({
-    next: ({ surveyRows, measureRows, supportRows, reviewRows }) => {
-      surveys.value = surveyRows
-      measures.value = measureRows
-      supports.value = supportRows
-      reviews.value = reviewRows
+    next: ({ treeRows, surveyRows, measureRows, supportRows, reviewRows }) => {
+      // 古树档案被作废时，其下记录不进入任何时间线（即使子记录本身未带作废标记）
+      const activeTreeIds = new Set(
+        treeRows.filter((row) => row.voided !== true).map((row) => row.id)
+      )
+      const byActiveTree = <T extends { treeId: string; voided?: boolean }>(list: T[]): T[] =>
+        list.filter((row) => row.voided !== true && activeTreeIds.has(row.treeId))
+      surveys.value = byActiveTree(surveyRows)
+      measures.value = byActiveTree(measureRows)
+      supports.value = byActiveTree(supportRows)
+      reviews.value = byActiveTree(reviewRows)
       loading.value = false
       error.value = ''
     },

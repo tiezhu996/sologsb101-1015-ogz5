@@ -44,35 +44,49 @@ export interface SnapshotParseResult {
   snapshot: DatabaseSnapshot | null
 }
 
-/** 解析并校验导入的 JSON 存档 */
-export function parseSnapshot(text: string): SnapshotParseResult {
+/**
+ * 解析外业包 JSON 的基础结构（名称、五个集合数组、结构版本）。
+ * 结构版本超前不在此处拦截，而交由增量合并引擎记入失败报告并整包拒绝，
+ * 这样失败记录可以在复评页列出来，而不只是弹一条消息。
+ */
+export function parseMergePackage(text: string): SnapshotParseResult {
   let raw: unknown
   try {
     raw = JSON.parse(text)
   } catch {
-    return { ok: false, message: 'JSON 解析失败，请确认文件内容完整。', snapshot: null }
+    return { ok: false, message: 'JSON 解析失败，请确认外业包文件内容完整。', snapshot: null }
   }
   if (typeof raw !== 'object' || raw === null) {
-    return { ok: false, message: '存档格式不正确：顶层必须是对象。', snapshot: null }
+    return { ok: false, message: '外业包格式不正确：顶层必须是对象。', snapshot: null }
   }
   const data = raw as Partial<DatabaseSnapshot>
   if (data.name !== DB_NAME) {
-    return { ok: false, message: `存档不属于本项目：期望 name = ${DB_NAME}，实际为 ${String(data.name)}。`, snapshot: null }
+    return { ok: false, message: `外业包不属于本项目：期望 name = ${DB_NAME}，实际为 ${String(data.name)}。`, snapshot: null }
   }
-  if (typeof data.schemaVersion !== 'number' || data.schemaVersion > DB_SCHEMA_VERSION) {
-    return {
-      ok: false,
-      message: `存档数据结构版本不兼容：当前支持 ≤ v${DB_SCHEMA_VERSION}，实际为 v${String(data.schemaVersion)}。`,
-      snapshot: null,
-    }
+  if (typeof data.schemaVersion !== 'number') {
+    return { ok: false, message: '外业包缺少数字类型的 schemaVersion 字段。', snapshot: null }
   }
   const collections: Array<keyof DatabaseSnapshot> = ['trees', 'surveys', 'measures', 'supports', 'reviews']
   for (const key of collections) {
     if (!Array.isArray(data[key])) {
-      return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null }
+      return { ok: false, message: `外业包缺少 ${String(key)} 数组。`, snapshot: null }
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot }
+  return { ok: true, message: '外业包结构校验通过。', snapshot: data as DatabaseSnapshot }
+}
+
+/** 解析并校验导入的整库 JSON 存档（导出 / 整库存档入口使用） */
+export function parseSnapshot(text: string): SnapshotParseResult {
+  const result = parseMergePackage(text)
+  if (!result.ok || result.snapshot === null) return result
+  if (result.snapshot.schemaVersion > DB_SCHEMA_VERSION) {
+    return {
+      ok: false,
+      message: `存档数据结构版本不兼容：当前支持 ≤ v${DB_SCHEMA_VERSION}，实际为 v${result.snapshot.schemaVersion}。`,
+      snapshot: null,
+    }
+  }
+  return { ok: true, message: '存档校验通过。', snapshot: result.snapshot }
 }
 
 /** 生成古树养护总览 CSV（一树一行） */
@@ -108,12 +122,18 @@ export function buildTreeCsv(
     '最新趋势',
   ]
   const lines: string[] = [header.map(csvCell).join(',')]
-  trees.forEach((tree) => {
-    const treeSurveys = surveys.filter((row) => row.treeId === tree.id).sort((a, b) => a.date.localeCompare(b.date))
+  trees
+    .filter((tree) => tree.voided !== true)
+    .forEach((tree) => {
+    const treeSurveys = surveys
+      .filter((row) => row.treeId === tree.id && row.voided !== true)
+      .sort((a, b) => a.date.localeCompare(b.date))
     const latest = treeSurveys.length > 0 ? treeSurveys[treeSurveys.length - 1] : null
-    const treeMeasures = measures.filter((row) => row.treeId === tree.id)
-    const treeSupports = supports.filter((row) => row.treeId === tree.id)
-    const treeReviews = reviews.filter((row) => row.treeId === tree.id).sort((a, b) => a.date.localeCompare(b.date))
+    const treeMeasures = measures.filter((row) => row.treeId === tree.id && row.voided !== true)
+    const treeSupports = supports.filter((row) => row.treeId === tree.id && row.voided !== true)
+    const treeReviews = reviews
+      .filter((row) => row.treeId === tree.id && row.voided !== true)
+      .sort((a, b) => a.date.localeCompare(b.date))
     const latestReview = treeReviews.length > 0 ? treeReviews[treeReviews.length - 1] : null
     const overdue = treeSupports.filter((row) => isSupportOverdue(row.lastCheckDate, row.checkCycleMon))
     lines.push(
@@ -181,13 +201,17 @@ export function buildTodoText(
   supports: Support[],
   reviews: Review[],
 ): string {
-  const lines: string[] = [`【古树名木复壮养护待办】共 ${trees.length} 株在档`]
-  trees.forEach((tree) => {
-    const pending = measures.filter((row) => row.treeId === tree.id && row.state !== '已完成').length
+  const lines: string[] = [`【古树名木复壮养护待办】共 ${trees.filter((tree) => tree.voided !== true).length} 株在档`]
+  trees
+    .filter((tree) => tree.voided !== true)
+    .forEach((tree) => {
+    const pending = measures.filter((row) => row.treeId === tree.id && row.voided !== true && row.state !== '已完成').length
     const overdue = supports.filter(
-      (row) => row.treeId === tree.id && isSupportOverdue(row.lastCheckDate, row.checkCycleMon),
+      (row) => row.treeId === tree.id && row.voided !== true && isSupportOverdue(row.lastCheckDate, row.checkCycleMon),
     ).length
-    const treeReviews = reviews.filter((row) => row.treeId === tree.id).sort((a, b) => a.date.localeCompare(b.date))
+    const treeReviews = reviews
+      .filter((row) => row.treeId === tree.id && row.voided !== true)
+      .sort((a, b) => a.date.localeCompare(b.date))
     const latest = treeReviews.length > 0 ? treeReviews[treeReviews.length - 1] : null
     lines.push(
       `· ${tree.code} ${tree.species}（${tree.protectLevel}，树龄 ${tree.ageYears} 年）待办措施 ${pending} 项，超期加固件 ${overdue} 件，最新长势 ${

@@ -19,7 +19,7 @@ import { today } from '@/utils/id'
 
 const treeStore = useTreeStore()
 
-const { rows, loading, create, update, remove } = useIdbTable<Support>(db.supports, { sortByUpdatedAt: false })
+const { rows, loading, create, update, setVoided, remove } = useIdbTable<Support>(db.supports, { sortByUpdatedAt: false })
 
 const keyword = ref('')
 const treeFilter = ref('all')
@@ -52,7 +52,9 @@ const treeLabel = computed<Record<string, string>>(() =>
 
 const filtered = computed<Support[]>(() => {
   const key = keyword.value.trim().toLowerCase()
+  const activeTreeIds = new Set(treeStore.trees.map((tree) => tree.id))
   return rows.value
+    .filter((row) => activeTreeIds.has(row.treeId))
     .filter((row) => {
       if (treeFilter.value !== 'all' && row.treeId !== treeFilter.value) return false
       if (typeFilter.value !== 'all' && row.type !== typeFilter.value) return false
@@ -67,11 +69,21 @@ const filtered = computed<Support[]>(() => {
     .sort((a, b) => a.installDate.localeCompare(b.installDate))
 })
 
-const overdueRows = computed<Support[]>(() =>
-  rows.value.filter((row) => isSupportOverdue(row.lastCheckDate, row.checkCycleMon))
-)
+const overdueRows = computed<Support[]>(() => {
+  const activeTreeIds = new Set(treeStore.trees.map((tree) => tree.id))
+  return rows.value.filter((row) => activeTreeIds.has(row.treeId) && isSupportOverdue(row.lastCheckDate, row.checkCycleMon))
+})
 
-const coveredTrees = computed<number>(() => new Set(rows.value.map((row) => row.treeId)).size)
+const coveredTrees = computed<number>(() => {
+  const activeTreeIds = new Set(treeStore.trees.map((tree) => tree.id))
+  return new Set(rows.value.filter((row) => activeTreeIds.has(row.treeId)).map((row) => row.treeId)).size
+})
+
+/** 父古树仍在档的加固件（父档案被作废时子记录一并隐藏） */
+const coveredRows = computed<Support[]>(() => {
+  const activeTreeIds = new Set(treeStore.trees.map((tree) => tree.id))
+  return rows.value.filter((row) => activeTreeIds.has(row.treeId))
+})
 
 onMounted(() => {
   void treeStore.loadAll()
@@ -142,6 +154,20 @@ async function handleDelete(row: Support): Promise<void> {
   ElMessage.success('加固件记录已删除')
 }
 
+async function handleVoid(row: Support): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `确认作废「${row.type}」加固件记录？作废后该件不再出现在超期提醒与统计中，但会保留以供外业同步。`,
+      '作废确认',
+      { type: 'warning', confirmButtonText: '作废', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' }
+    )
+  } catch {
+    return
+  }
+  await setVoided(row.id)
+  ElMessage.success('加固件记录已作废')
+}
+
 async function handleMarkChecked(row: Support): Promise<void> {
   await markSupportChecked(row.id, today())
   ElMessage.success(`已登记 ${treeLabel.value[row.treeId] ?? '该古树'} 的 ${row.type} 本次检查`)
@@ -156,7 +182,7 @@ function handleFilterChange(key: string, value: string): void {
 <template>
   <div>
     <div class="stat-row">
-      <StatBadge label="加固件总数" :value="rows.length" suffix="件" tone="primary" icon="Histogram" />
+      <StatBadge label="加固件总数" :value="coveredRows.length" suffix="件" tone="primary" icon="Histogram" />
       <StatBadge
         label="超期未检查"
         :value="overdueRows.length"
@@ -229,7 +255,7 @@ function handleFilterChange(key: string, value: string): void {
       </FilterBar>
 
       <EmptyPanel
-        v-if="rows.length === 0 && !loading"
+        v-if="coveredRows.length === 0 && !loading"
         title="还没有加固件记录"
         description="登记支撑杆、拉纤与避雷件，设置检查周期后系统会自动高亮超期未检查的设施并生成提醒。"
         action-text="登记第一件加固件"
@@ -284,7 +310,7 @@ function handleFilterChange(key: string, value: string): void {
             <el-tag v-else type="success" effect="light">周期内</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="260" fixed="right">
+        <el-table-column label="操作" width="320" fixed="right">
           <template #default="{ row }">
             <el-button
               link
@@ -295,6 +321,7 @@ function handleFilterChange(key: string, value: string): void {
               登记本次检查
             </el-button>
             <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
+            <el-button link type="warning" size="small" @click="handleVoid(row)">作废</el-button>
             <el-button link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
           </template>
         </el-table-column>

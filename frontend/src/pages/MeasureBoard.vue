@@ -57,7 +57,9 @@ const treeLabel = computed<Record<string, string>>(() =>
 
 const filtered = computed<Measure[]>(() => {
   const keyword = measureStore.filters.keyword.trim().toLowerCase()
+  const activeTreeIds = new Set(treeStore.trees.map((tree) => tree.id))
   return rows.value
+    .filter((row) => activeTreeIds.has(row.treeId))
     .filter((row) => {
       if (measureStore.filters.treeId !== 'all' && row.treeId !== measureStore.filters.treeId) return false
       if (measureStore.filters.type !== 'all' && row.type !== measureStore.filters.type) return false
@@ -73,9 +75,11 @@ const filtered = computed<Measure[]>(() => {
 })
 
 const stats = computed(() => {
-  const total = rows.value.length
-  const done = rows.value.filter((row) => row.state === '已完成').length
-  const pending = rows.value.filter((row) => row.state !== '已完成').length
+  const activeTreeIds = new Set(treeStore.trees.map((tree) => tree.id))
+  const activeRows = rows.value.filter((row) => activeTreeIds.has(row.treeId))
+  const total = activeRows.length
+  const done = activeRows.filter((row) => row.state === '已完成').length
+  const pending = activeRows.filter((row) => row.state !== '已完成').length
   return { total, done, pending, donePct: total === 0 ? 0 : Math.round((done / total) * 1000) / 10 }
 })
 
@@ -147,6 +151,20 @@ async function handleDelete(row: Measure): Promise<void> {
   }
   await measureStore.deleteMeasure(row.id)
   ElMessage.success('措施已删除')
+}
+
+async function handleVoid(row: Measure): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `确认作废「${row.type}」措施（${row.date}）？作废后该措施不再进入待办，已完成措施还会从最近复壮日期计算中剔除并重算。`,
+      '作废确认',
+      { type: 'warning', confirmButtonText: '作废', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' }
+    )
+  } catch {
+    return
+  }
+  await measureStore.voidMeasureRecord(row.id)
+  ElMessage.success('措施已作废，最近复壮日期已重算')
 }
 
 async function handleAdvance(row: Measure): Promise<void> {
@@ -352,12 +370,13 @@ function handleFilterChange(key: string, value: string): void {
             </el-button>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="230" fixed="right">
+        <el-table-column label="操作" width="290" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" :disabled="row.state === '已完成'" @click="handleAdvance(row)">
               推进状态
             </el-button>
             <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
+            <el-button link type="warning" size="small" @click="handleVoid(row)">作废</el-button>
             <el-button link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
           </template>
         </el-table-column>

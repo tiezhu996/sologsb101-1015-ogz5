@@ -31,6 +31,8 @@ export interface Tree {
   updatedAt: string
   /** 数据行结构修订号，便于后续按行迁移 */
   revision: number
+  /** 作废标记：作废记录保留为墓碑参与同步，正常列表与统计中隐藏（老数据与外业包可能缺省，按未作废处理） */
+  voided?: boolean
 }
 
 /** 新建 / 编辑古树档案的表单草稿 */

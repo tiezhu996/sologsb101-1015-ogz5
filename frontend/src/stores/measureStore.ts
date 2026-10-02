@@ -6,11 +6,13 @@ import { reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 import type { Measure, MeasureDraft, MeasureState, MeasureType } from '../types/measure'
 import {
+  ROW_REVISION,
   batchSetMeasureState,
   db,
   initDatabase,
   putMeasure,
   removeMeasure,
+  voidMeasure,
 } from '../utils/db'
 import { nowIso, uuid } from '../utils/id'
 import { useTreeStore } from './treeStore'
@@ -95,7 +97,8 @@ export const useMeasureStore = defineStore('measure', () => {
       state: draft.state,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
+      voided: false,
     }
     await putMeasure(row)
     revision.value += 1
@@ -125,6 +128,16 @@ export const useMeasureStore = defineStore('measure', () => {
     clearDraft(measureId)
     selectedIds.value = selectedIds.value.filter((id) => id !== measureId)
     revision.value += 1
+  }
+
+  /** 作废措施：打墓碑标记并重算所属古树的最近复壮日期 */
+  async function voidMeasureRecord(measureId: string): Promise<void> {
+    await voidMeasure(measureId)
+    clearDraft(measureId)
+    selectedIds.value = selectedIds.value.filter((id) => id !== measureId)
+    revision.value += 1
+    lastMessage.value = '措施已作废，古树最近复壮日期已重算'
+    await useTreeStore().refreshCounts()
   }
 
   /** 推进到下一状态：计划 → 实施中 → 已完成 */
@@ -171,6 +184,7 @@ export const useMeasureStore = defineStore('measure', () => {
     createMeasure,
     updateMeasure,
     deleteMeasure,
+    voidMeasureRecord,
     advance,
     batchSetState,
   }
