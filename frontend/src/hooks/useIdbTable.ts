@@ -1,11 +1,13 @@
 /**
  * Dexie 单表增删改查 + liveQuery 响应式订阅封装（Vue 版）
  * 页面统一通过它读写 IndexedDB，避免组件内部直接触碰 Dexie 实例。
+ * 已作废（deletedAt 非空）的记录对页面透明：查询自动过滤，删除一律软删除。
  */
 import { liveQuery, type Table } from 'dexie'
 import { onScopeDispose, ref, shallowRef, type Ref } from 'vue'
 import { ROW_REVISION } from '../utils/db'
 import { nowIso, uuid } from '../utils/id'
+import { isActiveRow } from '../utils/merge'
 
 /** 所有持久化实体共有的行结构 */
 export interface IdbRow {
@@ -13,10 +15,12 @@ export interface IdbRow {
   createdAt: string
   updatedAt: string
   revision: number
+  /** 作废时间（ISO），空串 = 在册 */
+  deletedAt: string
 }
 
-/** 新增记录入参：id / 时间戳 / 修订号由封装层补齐 */
-export type NewRow<T extends IdbRow> = Omit<T, 'id' | 'createdAt' | 'updatedAt' | 'revision'> & {
+/** 新增记录入参：id / 时间戳 / 修订号 / 作废标记由封装层补齐 */
+export type NewRow<T extends IdbRow> = Omit<T, 'id' | 'createdAt' | 'updatedAt' | 'revision' | 'deletedAt'> & {
   id?: string
 }
 
@@ -55,8 +59,9 @@ export function useIdbTable<T extends IdbRow>(
   const subscription = shallowRef<{ unsubscribe: () => void } | null>(null)
 
   const applySort = (list: T[]): T[] => {
-    if (!sortByUpdatedAt) return [...list]
-    return [...list].sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))
+    const active = list.filter(isActiveRow)
+    if (!sortByUpdatedAt) return active
+    return active.sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))
   }
 
   const refresh = async (): Promise<void> => {
@@ -105,6 +110,7 @@ export function useIdbTable<T extends IdbRow>(
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
+      deletedAt: '',
     } as T
     await table.put(record)
     return record
@@ -118,8 +124,10 @@ export function useIdbTable<T extends IdbRow>(
     await table.put({ ...row, updatedAt: nowIso() })
   }
 
+  /** 软删除：写作废标记，墓碑随快照导出参与增量合并 */
   const remove = async (id: string): Promise<void> => {
-    await table.delete(id)
+    const stamp = nowIso()
+    await table.update(id, { deletedAt: stamp, updatedAt: stamp } as never)
   }
 
   const bulkPut = async (list: T[]): Promise<void> => {

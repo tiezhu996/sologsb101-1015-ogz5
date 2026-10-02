@@ -10,6 +10,7 @@ import type { Measure } from '../types/measure'
 import type { Support } from '../types/support'
 import type { Review } from '../types/review'
 import { db, initDatabase } from '../utils/db'
+import { isActiveRow } from '../utils/merge'
 
 /** 时间线条目类型 */
 export type HistoryKind = 'survey' | 'measure' | 'support' | 'review'
@@ -115,10 +116,10 @@ export function useTreeHistory(treeId: Ref<string | null> | string | null): UseT
     return { surveyRows, measureRows, supportRows, reviewRows }
   }).subscribe({
     next: ({ surveyRows, measureRows, supportRows, reviewRows }) => {
-      surveys.value = surveyRows
-      measures.value = measureRows
-      supports.value = supportRows
-      reviews.value = reviewRows
+      surveys.value = surveyRows.filter(isActiveRow)
+      measures.value = measureRows.filter(isActiveRow)
+      supports.value = supportRows.filter(isActiveRow)
+      reviews.value = reviewRows.filter(isActiveRow)
       loading.value = false
       error.value = ''
     },

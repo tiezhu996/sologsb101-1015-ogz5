@@ -19,10 +19,10 @@ export const SEED_IDS = {
   treeC: 'tree-ritan-0246',
 } as const
 
-type Row<T> = Omit<T, 'createdAt' | 'updatedAt' | 'revision'>
+type Row<T> = Omit<T, 'createdAt' | 'updatedAt' | 'revision' | 'deletedAt'>
 
 function wrap<T>(row: Row<T>): T {
-  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION } as T
+  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION, deletedAt: '' } as T
 }
 
 /**

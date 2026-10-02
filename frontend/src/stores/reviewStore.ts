@@ -1,12 +1,15 @@
 /**
  * 长势复评状态管理（Pinia）
  * 维护长势筛选条件与复评结论派生值；长势为衰弱 / 濒危时强制填写后续措施。
+ * 同时负责外业包增量合并：解析存档、执行合并、留存本次合并报告供复评页展示。
  */
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 import type { Review, ReviewDraft, Trend, Vigor } from '../types/review'
 import { VIGOR_NEED_FOLLOW_UP, VIGOR_OPTIONS } from '../types/review'
-import { db, initDatabase, putReview, removeReview } from '../utils/db'
+import { ROW_REVISION, db, initDatabase, mergeSnapshot, putReview, removeReview } from '../utils/db'
+import { emptyMergeStats, type MergeReport } from '../utils/merge'
+import { parseSnapshot } from '../utils/export'
 import { nowIso, uuid } from '../utils/id'
 import { useTreeStore } from './treeStore'
 
@@ -29,6 +32,9 @@ export const useReviewStore = defineStore('review', () => {
   const selectedIds = ref<string[]>([])
   const lastMessage = ref('')
   const revision = ref(0)
+  /** 最近一次外业包增量合并的报告（成功或整包拒绝），供复评页展示 */
+  const lastMergeReport = ref<MergeReport | null>(null)
+  const merging = ref(false)
 
   /** 长势分布统计，供复评页徽标使用 */
   const vigorStats = computed<Record<Vigor, number>>(() => {
@@ -105,7 +111,8 @@ export const useReviewStore = defineStore('review', () => {
       followUp: draft.followUp.trim(),
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
+      deletedAt: '',
     }
     await putReview(row)
     revision.value += 1
@@ -141,6 +148,42 @@ export const useReviewStore = defineStore('review', () => {
     revision.value += 1
   }
 
+  /**
+   * 导入外业包并执行增量合并。
+   * 解析或校验失败时整包拒绝（现有档案保持原样），报告写入 lastMergeReport 供复评页列出失败记录；
+   * 成功后刷新统计，liveQuery 订阅会自动刷新超期提醒、历史时间线与复评待办。
+   */
+  async function mergePackage(text: string): Promise<MergeReport> {
+    merging.value = true
+    try {
+      const parsed = parseSnapshot(text)
+      if (!parsed.ok || parsed.snapshot === null) {
+        const report: MergeReport = {
+          ok: false,
+          message: `外业包已整包拒绝：${parsed.message}`,
+          finishedAt: nowIso(),
+          totalIncoming: 0,
+          stats: emptyMergeStats(),
+          failures: [{ table: 'package', recordId: '—', reason: parsed.message }],
+          rewrittenTrees: 0,
+        }
+        lastMergeReport.value = report
+        lastMessage.value = report.message
+        return report
+      }
+      const report = await mergeSnapshot(parsed.snapshot)
+      lastMergeReport.value = report
+      lastMessage.value = report.message
+      if (report.ok) {
+        await useTreeStore().refreshCounts()
+        revision.value += 1
+      }
+      return report
+    } finally {
+      merging.value = false
+    }
+  }
+
   async function refreshCounts(): Promise<void> {
     await useTreeStore().refreshCounts()
   }
@@ -150,6 +193,8 @@ export const useReviewStore = defineStore('review', () => {
     selectedIds,
     lastMessage,
     revision,
+    lastMergeReport,
+    merging,
     vigorStats,
     followUpMissing,
     requireFollowUp,
@@ -161,6 +206,7 @@ export const useReviewStore = defineStore('review', () => {
     createReview,
     updateReview,
     deleteReview,
+    mergePackage,
     refreshCounts,
   }
 })

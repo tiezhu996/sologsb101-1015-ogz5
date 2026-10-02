@@ -23,6 +23,8 @@ export interface Support {
   createdAt: string
   updatedAt: string
   revision: number
+  /** 作废时间（ISO），空串 = 在册；增量合并时按修订时间与作废标记裁决 */
+  deletedAt: string
 }
 
 /** 新建 / 编辑加固件的表单草稿 */

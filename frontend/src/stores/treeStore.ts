@@ -21,6 +21,7 @@ import {
   putTree,
   removeTree,
 } from '../utils/db'
+import { isActiveRow } from '../utils/merge'
 import { nowIso, uuid } from '../utils/id'
 import {
   LEAN_LEVEL_LABEL,
@@ -211,12 +212,12 @@ export const useTreeStore = defineStore('tree', () => {
           return { treeRows, surveyRows, measureRows, supportRows, reviewRows }
         }).subscribe({
           next: ({ treeRows, surveyRows, measureRows, supportRows, reviewRows }) => {
-            const sorted = [...treeRows].sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
+            const sorted = treeRows.filter(isActiveRow).sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
             trees.value = sorted
-            surveys.value = surveyRows
-            measures.value = measureRows
-            supports.value = supportRows
-            reviews.value = reviewRows
+            surveys.value = surveyRows.filter(isActiveRow)
+            measures.value = measureRows.filter(isActiveRow)
+            supports.value = supportRows.filter(isActiveRow)
+            reviews.value = reviewRows.filter(isActiveRow)
             loading.value = false
             ready.value = true
             error.value = ''
@@ -268,6 +269,7 @@ export const useTreeStore = defineStore('tree', () => {
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
+      deletedAt: '',
     }
     await putTree(row)
     selectTree(row.id)

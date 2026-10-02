@@ -1,7 +1,8 @@
 <script setup lang="ts">
 /**
  * /reviews 长势复评与结构版本
- * 复评增删改（衰弱 / 濒危强制填写后续措施）、古树历史时间线、JSON 导入导出与结构版本查看。
+ * 复评增删改（衰弱 / 濒危强制填写后续措施）、古树历史时间线、JSON 导出与外业包增量合并。
+ * 增量合并：同一条记录按修订时间与作废标记裁决；校验失败整包拒绝并在本页列出失败记录。
  * 消费模型：Review、Measure、全部模型；复用组件：<VigorTag>、<EmptyPanel>、<StatBadge>、<FilterBar>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -15,8 +16,9 @@ import { useIdbTable } from '@/hooks/useIdbTable'
 import { HISTORY_KIND_LABEL, useTreeHistory } from '@/hooks/useTreeHistory'
 import { useReviewStore } from '@/stores/reviewStore'
 import { useTreeStore } from '@/stores/treeStore'
-import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
-import { exportSnapshotJson, exportTreeCsvFile, parseSnapshot } from '@/utils/export'
+import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, resetDatabase } from '@/utils/db'
+import { exportSnapshotJson, exportTreeCsvFile } from '@/utils/export'
+import { MERGE_TABLES, MERGE_TABLE_LABEL, sumMergeStats, type MergeTableName } from '@/utils/merge'
 import { TREND_OPTIONS, VIGOR_OPTIONS, VIGOR_NEED_FOLLOW_UP, type Review, type ReviewDraft, type Trend, type Vigor } from '@/types/review'
 
 const router = useRouter()
@@ -182,15 +184,40 @@ async function handleImport(uploadFile: UploadFile): Promise<void> {
   const raw = uploadFile.raw
   if (raw === undefined) return
   const text = await raw.text()
-  const result = parseSnapshot(text)
-  if (!result.ok || result.snapshot === null) {
-    ElMessage.error(result.message)
-    return
+  const report = await reviewStore.mergePackage(text)
+  if (report.ok) {
+    ElMessage.success(report.message)
+  } else {
+    ElMessage.error(report.message)
   }
-  await importSnapshot(result.snapshot)
-  await treeStore.loadAll()
-  ElMessage.success(`导入成功：${result.message}`)
 }
+
+/** 本次合并报告（成功或整包拒绝），驱动下方「外业包增量合并」卡片 */
+const mergeReport = computed(() => reviewStore.lastMergeReport)
+
+const mergeTotal = computed(() =>
+  mergeReport.value === null ? null : sumMergeStats(mergeReport.value.stats)
+)
+
+const mergeStatRows = computed(() => {
+  const report = mergeReport.value
+  if (report === null) return []
+  return MERGE_TABLES.map((table: MergeTableName) => ({
+    table,
+    label: MERGE_TABLE_LABEL[table],
+    ...report.stats[table],
+  }))
+})
+
+const mergeFailureRows = computed(() => {
+  if (mergeReport.value === null) return []
+  return mergeReport.value.failures.map((failure, index) => ({
+    key: `${failure.table}-${failure.recordId}-${index}`,
+    tableLabel: failure.table === 'package' ? '整包' : MERGE_TABLE_LABEL[failure.table],
+    recordId: failure.recordId,
+    reason: failure.reason,
+  }))
+})
 
 function handleReset(): void {
   ElMessageBox.confirm(
@@ -277,9 +304,9 @@ function handleFilterChange(key: string, value: string): void {
                   accept=".json"
                   :on-change="handleImport"
                 >
-                  <el-button>
+                  <el-button :loading="reviewStore.merging">
                     <el-icon><Upload /></el-icon>
-                    <span>导入 JSON 存档</span>
+                    <span>导入外业包合并</span>
                   </el-button>
                 </el-upload>
                 <el-button type="danger" plain @click="handleReset">重置演示数据</el-button>
@@ -415,6 +442,68 @@ function handleFilterChange(key: string, value: string): void {
       </el-col>
     </el-row>
 
+    <el-card shadow="never" class="merge-card">
+      <template #header>
+        <div class="card-header">
+          <span class="card-header__title">外业包增量合并</span>
+          <span class="cell-sub">
+            同一记录按修订时间与作废标记裁决，本端较新时保留站内内容；校验失败整包拒绝，现有档案保持原样
+          </span>
+        </div>
+      </template>
+
+      <el-empty
+        v-if="mergeReport === null"
+        description="尚未执行合并：点击右上角「导入外业包合并」，选择平板离线记录导出的 JSON 存档。"
+        :image-size="64"
+      />
+
+      <template v-else>
+        <el-alert
+          :type="mergeReport.ok ? 'success' : 'error'"
+          :title="mergeReport.message"
+          :description="`合并时间 ${mergeReport.finishedAt}；合并后已按已完成复壮措施重算最近复壮日期，并刷新加固件超期提醒、历史时间线与复评待办。`"
+          show-icon
+          :closable="false"
+          class="mb-14"
+        />
+
+        <template v-if="mergeReport.ok && mergeTotal !== null">
+          <div class="stat-row">
+            <StatBadge label="本次处理" :value="mergeReport.totalIncoming" suffix="条" tone="primary" icon="Histogram" hint="外业包记录总数" />
+            <StatBadge label="新增" :value="mergeTotal.added" suffix="条" tone="success" icon="DataLine" hint="本端没有、外业包新增的记录" />
+            <StatBadge label="更新" :value="mergeTotal.updated" suffix="条" tone="warning" icon="DataLine" hint="外业包修订时间更新，覆盖本端" />
+            <StatBadge label="作废" :value="mergeTotal.voided" suffix="条" tone="danger" icon="Warning" hint="作废标记生效（含级联作废）" />
+            <StatBadge label="保留本端" :value="mergeTotal.kept" suffix="条" tone="info" icon="PieChart" hint="本端修订时间更新或相同，未被覆盖" />
+            <StatBadge
+              label="复壮日期回写"
+              :value="mergeReport.rewrittenTrees"
+              suffix="株"
+              tone="primary"
+              icon="TrendCharts"
+              hint="合并后按已完成复壮措施重算最近复壮日期并发生回写的古树数"
+            />
+          </div>
+          <el-table :data="mergeStatRows" row-key="table" stripe size="small">
+            <el-table-column prop="label" label="数据表" min-width="140" />
+            <el-table-column prop="added" label="新增" width="110" align="right" />
+            <el-table-column prop="updated" label="更新" width="110" align="right" />
+            <el-table-column prop="voided" label="作废" width="110" align="right" />
+            <el-table-column prop="kept" label="保留本端" width="110" align="right" />
+          </el-table>
+        </template>
+
+        <template v-else>
+          <p class="merge-failure-tip">以下 {{ mergeFailureRows.length }} 条记录未通过校验，整包已拒绝，请在外业端修正后重新导出：</p>
+          <el-table :data="mergeFailureRows" row-key="key" stripe size="small">
+            <el-table-column prop="tableLabel" label="数据表" width="120" />
+            <el-table-column prop="recordId" label="记录编号" min-width="180" />
+            <el-table-column prop="reason" label="冲突 / 失败原因" min-width="320" />
+          </el-table>
+        </template>
+      </template>
+    </el-card>
+
     <el-dialog v-model="dialogVisible" :title="editingId === null ? '新增长势复评' : '编辑长势复评'" width="640px">
       <el-form ref="formRef" :model="form" :rules="rules" label-width="110px">
         <el-form-item label="古树" prop="treeId">
@@ -529,5 +618,15 @@ function handleFilterChange(key: string, value: string): void {
 
 .mb-14 {
   margin-bottom: 14px;
+}
+
+.merge-card {
+  margin-top: 14px;
+}
+
+.merge-failure-tip {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: #c0392b;
 }
 </style>

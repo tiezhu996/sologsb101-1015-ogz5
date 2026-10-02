@@ -75,7 +75,7 @@ sologsb101-1015/
         ├── hooks/              # useTreeHistory.ts useIdbTable.ts
         ├── pages/              # 5 个模块页面
         ├── router/index.ts     # 路由表 + ROUTES 常量
-        └── utils/              # dimension.ts db.ts export.ts seed.ts id.ts
+        └── utils/              # dimension.ts db.ts export.ts merge.ts seed.ts id.ts
 ```
 
 ---
@@ -84,11 +84,11 @@ sologsb101-1015/
 
 | 路由 | 页面文件 | 功能 |
 | --- | --- | --- |
-| `/trees` | `pages/TreeList.vue` | 古树一树一档：新建/编辑/级联删除、按保护级别与树种筛选、回显检查次数与最新长势等级 |
+| `/trees` | `pages/TreeList.vue` | 古树一树一档：新建/编辑/级联作废、按保护级别与树种筛选、回显检查次数与最新长势等级 |
 | `/trees/:id/surveys` | `pages/TreeSurvey.vue` | 树体与立地检查：录树高/胸径/冠幅/倾斜/空洞并对比上次、年化生长量、古树历史时间线 |
 | `/measures` | `pages/MeasureBoard.vue` | 复壮措施台账：按类型与实施状态筛选、行内草稿、批量改状态，完成即回写最近复壮日期 |
 | `/supports` | `pages/SupportBoard.vue` | 支撑加固与避雷件登记：超周期未检查自动高亮 + 顶部提醒 + 一键登记本次检查 |
-| `/reviews` | `pages/ReviewView.vue` | 长势复评与结构版本：衰弱/濒危强制填写后续措施、历史时间线、JSON 导入导出 |
+| `/reviews` | `pages/ReviewView.vue` | 长势复评与结构版本：衰弱/濒危强制填写后续措施、历史时间线、JSON 导出与外业包增量合并 |
 
 `/` 重定向到 `/trees`，未匹配路径统一回落到 `/trees`。
 **层级路由支持直接深链**：把 `http://localhost:22815/trees/tree-guozijian-0007/surveys` 直接粘贴到地址栏即可打开；
@@ -100,12 +100,13 @@ sologsb101-1015/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbheritagetree`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移：
-  * `surveys` 增加 `[treeId+date]` 复合索引、`measures` 增加 `operator` 索引、`supports` 增加 `lastCheckDate` 索引、`reviews` 增加 `trend` 索引；
-  * 回填 `revision` / `createdAt` / `updatedAt`；
-  * 为 `trees` 补齐 `lastMeasureDate`（最近复壮日期）回写字段；
-  * 为 `reviews` 补齐 `followUp`（后续措施）字段；
-  * 为 `supports` 补齐 `lastCheckDate` 与 `checkCycleMon` 缺省值。
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移，
+  `version(3)` 为全部表补齐 `deletedAt` 作废标记（软删除，支撑外业包增量合并）：
+  * v2：`surveys` 增加 `[treeId+date]` 复合索引、`measures` 增加 `operator` 索引、`supports` 增加 `lastCheckDate` 索引、`reviews` 增加 `trend` 索引；
+    回填 `revision` / `createdAt` / `updatedAt`；为 `trees` 补齐 `lastMeasureDate`、为 `reviews` 补齐 `followUp`、为 `supports` 补齐 `lastCheckDate` 与 `checkCycleMon` 缺省值；
+  * v3：五张表统一回填 `deletedAt = ''`（空串 = 在册，非空 = 作废时间），行修订号 `ROW_REVISION` 提升到 3。
+* **软删除（作废标记）**：所有「删除」操作（含删除古树的级联清理）一律写 `deletedAt` 墓碑而非物理清除；
+  列表、统计、时间线、CSV 汇总只展示在册记录；墓碑随整库快照一起导出，供增量合并裁决。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -124,11 +125,30 @@ sologsb101-1015/
     7 条长势复评（含衰弱 / 濒危样本且均已填写后续措施）。
   * 固定 id 如 `tree-guozijian-0007`、`tree-xiangshan-0113`、`tree-ritan-0246` 可直接用于深链验证。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的古树 id」这一界面偏好，不存业务数据。
-* 删除古树会**级联清理**其下的树体检查、复壮措施、加固件与复评记录（同一 Dexie 事务内完成）。
+* 删除古树会**级联作废**其下的树体检查、复壮措施、加固件与复评记录（同一 Dexie 事务内完成，均写 `deletedAt` 墓碑）。
 
 ---
 
-## 六、本地开发
+## 六、外业包增量合并
+
+外业人员用平板离线记录（导出 JSON 存档即外业包），回站后在 `/reviews` 页点「导入外业包合并」，
+把整库导入扩展为**增量合并**（`src/utils/merge.ts` 纯函数裁决 + `db.ts` 单事务落库）：
+
+* **裁决规则**：当前档案和外业包都能修改或作废记录。同一条记录按修订时间（`updatedAt`，缺失时退回
+  `createdAt`）与作废标记（`deletedAt`）决定保留哪版——修订时间新者胜出；时间相同作废标记优先；
+  再相同则保留本端，避免覆盖站内新补内容。
+* **级联作废**：外业包作废某株古树时，其在册检查、措施、加固件与复评记录一并作废。
+* **合并后重算**：按在册「已完成」复壮措施重算每株古树的最近复壮日期并回写；
+  加固件超期提醒、古树历史时间线与复评待办由 liveQuery 订阅自动刷新。
+* **整包拒绝**：遇存档版本超前（`schemaVersion` 高于本端）、记录缺编号（缺 `id` 或古树缺 `code`）、
+  包内编号重复或关联古树缺失时，整包拒绝且现有档案保持原样（读取、裁决、写入在同一事务内，
+  校验不过不写任何数据），失败记录与冲突逐条列在复评页「外业包增量合并」卡片中。
+* **处理数量**：合并成功后卡片展示本次处理总数及分表的新增 / 更新 / 作废 / 保留本端数量，
+  以及最近复壮日期回写的古树株数。
+
+---
+
+## 七、本地开发
 
 ```bash
 cd frontend
@@ -146,7 +166,7 @@ npm run preview      # 预览 dist 产物
 
 ---
 
-## 七、核心业务规则
+## 八、核心业务规则
 
 * **倾斜安全阈值**：< 5° 正常；5°–10° 需关注；> 10° 超限（`src/utils/dimension.ts`）。
 * **空洞风险**：1–2 处需关注，≥ 3 处判定为高风险，建议立即安排树洞修补与防腐处理。
@@ -155,3 +175,7 @@ npm run preview      # 预览 dist 产物
   「登记本次检查」会把最近检查日期置为今天并解除高亮。
 * **复评强制校验**：长势为「衰弱」或「濒危」时，后续措施为必填项，未填写无法保存。
 * **措施回写**：复壮措施状态改为「已完成」时，若实施日期晚于古树现有最近复壮日期，则自动回写该日期。
+* **软删除**：删除记录（含删除古树的级联清理）一律写作废标记 `deletedAt`，列表与统计只展示在册记录；
+  墓碑随 JSON 存档导出，外业包合并时参与裁决。
+* **增量合并**：外业包导入不覆盖整库，同一条记录按修订时间与作废标记逐条裁决，本端较新时保留站内内容；
+  校验失败（版本超前 / 缺编号 / 关联古树缺失）整包拒绝，详见「六、外业包增量合并」。
